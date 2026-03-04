@@ -208,13 +208,37 @@ PLIST_NAME="$PLIST_NAME"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; DIM='\033[2m'; BOLD='\033[1m'; RESET='\033[0m'
 
-case "\${1:-start}" in
+case "\${1:-help}" in
   start)
-    echo -e "\${CYAN}🌉 Starting Claude ↔ Telegram Bridge...\${RESET}"
+    SESSION_ID="\$2"
+    if [ -n "\$SESSION_ID" ]; then
+      echo -e "\${CYAN}🌉 Starting bridge connected to session: \${BOLD}\$SESSION_ID\${RESET}"
+      export CLAUDE_SESSION_MODE="\$SESSION_ID"
+    else
+      echo -e "\${CYAN}🌉 Starting bridge (continuing latest CLI session)\${RESET}"
+      export CLAUDE_SESSION_MODE="continue"
+    fi
     echo -e "   Dashboard: \${BOLD}http://localhost:7860\${RESET}"
     echo -e "   Press Ctrl+C to stop"
     echo ""
     cd "\$INSTALL_DIR" && source venv/bin/activate && python3 server.py
+    ;;
+  list)
+    echo -e "\${CYAN}📋 Claude CLI Sessions:\${RESET}"
+    echo ""
+    cd "\$HOME" && claude sessions list 2>/dev/null
+    SESSIONS_EXIT=\$?
+    if [ \$SESSIONS_EXIT -ne 0 ]; then
+      echo -e "\${YELLOW}⚠ Could not list sessions. Make sure Claude CLI is installed.\${RESET}"
+      exit 1
+    fi
+    echo ""
+    echo -e "\${DIM}────────────────────────────────────────\${RESET}"
+    echo -e "To start the bridge with a session:"
+    echo -e "  \${BOLD}claude-telegram start <session-id>\${RESET}"
+    echo ""
+    echo -e "Or start with the latest session:"
+    echo -e "  \${BOLD}claude-telegram start\${RESET}"
     ;;
   stop)
     echo -e "\${CYAN}🛑 Stopping bridge...\${RESET}"
@@ -223,7 +247,7 @@ case "\${1:-start}" in
   restart)
     "\$0" stop
     sleep 1
-    "\$0" start
+    "\$0" start "\$2"
     ;;
   status)
     if pgrep -f "\$INSTALL_DIR/server.py" &>/dev/null; then
@@ -235,9 +259,16 @@ case "\${1:-start}" in
     fi
     ;;
   bg)
-    echo -e "\${CYAN}🌉 Starting in background...\${RESET}"
+    SESSION_ID="\$2"
+    if [ -n "\$SESSION_ID" ]; then
+      echo -e "\${CYAN}🌉 Starting in background (session: \$SESSION_ID)...\${RESET}"
+      export CLAUDE_SESSION_MODE="\$SESSION_ID"
+    else
+      echo -e "\${CYAN}🌉 Starting in background (latest session)...\${RESET}"
+      export CLAUDE_SESSION_MODE="continue"
+    fi
     cd "\$INSTALL_DIR" && source venv/bin/activate
-    nohup python3 server.py > "\$INSTALL_DIR/bridge.log" 2>&1 &
+    CLAUDE_SESSION_MODE="\$CLAUDE_SESSION_MODE" nohup python3 server.py > "\$INSTALL_DIR/bridge.log" 2>&1 &
     PID=\$!
     echo -e "\${GREEN}✓ Running in background\${RESET} (PID \$PID)"
     echo -e "  Dashboard: \${BOLD}http://localhost:7860\${RESET}"
@@ -304,19 +335,26 @@ PEOF
     echo ""
     echo -e "\${BOLD}Claude ↔ Telegram Bridge\${RESET}"
     echo ""
-    echo "  Usage: claude-telegram <command>"
+    echo "  Usage: claude-telegram <command> [session-id]"
     echo ""
     echo -e "  \${BOLD}Commands:\${RESET}"
-    echo "    start         Start the bridge (foreground)"
-    echo "    stop          Stop the bridge"
-    echo "    restart       Restart the bridge"
-    echo "    bg            Start in background"
-    echo "    status        Check if running"
-    echo "    autostart     Start on macOS login"
-    echo "    no-autostart  Disable autostart"
-    echo "    config        Edit configuration"
-    echo "    logs          Tail log file"
-    echo "    uninstall     Remove everything"
+    echo "    list                 List Claude CLI sessions"
+    echo "    start                Start bridge (continues latest session)"
+    echo "    start <session-id>   Start bridge connected to a specific session"
+    echo "    stop                 Stop the bridge"
+    echo "    restart              Restart the bridge"
+    echo "    bg [session-id]      Start in background"
+    echo "    status               Check if running"
+    echo "    autostart            Start on macOS login"
+    echo "    no-autostart         Disable autostart"
+    echo "    config               Edit configuration"
+    echo "    logs                 Tail log file"
+    echo "    uninstall            Remove everything"
+    echo ""
+    echo -e "  \${BOLD}Quick start:\${RESET}"
+    echo "    claude-telegram list             # see your sessions"
+    echo "    claude-telegram start abc123     # connect to session abc123"
+    echo "    claude-telegram start            # continue latest session"
     echo ""
     ;;
 esac
@@ -383,9 +421,9 @@ def save_config(cfg):
 
 config = load_config()
 
-# Per-chat session mode: stores which Claude CLI session each chat is connected to
-# None = use --continue (most recent), "new" = no session flag, "<id>" = --resume <id>
-chat_session_mode = {}
+# Session mode from CLI: env CLAUDE_SESSION_MODE
+# "continue" = --continue (latest), "<id>" = --resume <id>, unset = --continue
+SESSION_MODE = os.environ.get("CLAUDE_SESSION_MODE", "continue")
 
 def init_db():
     conn = sqlite3.connect(str(DB_PATH)); conn.execute("PRAGMA journal_mode=WAL")
@@ -399,16 +437,13 @@ def init_db():
 def get_db():
     conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row; return conn
 
-async def call_claude_cli(message, session_mode=None):
-    """Call Claude CLI.
-    session_mode: None = --continue (most recent), "new" = fresh, "<id>" = --resume <id>
-    """
+async def call_claude_cli(message):
+    """Call Claude CLI using the session mode set at startup."""
     cmd = [config["claude_cli_path"], "-p", message]
-    if session_mode is None:
+    if SESSION_MODE == "continue":
         cmd.append("--continue")
-    elif session_mode != "new":
-        cmd.extend(["--resume", session_mode])
-    # "new" = no session flag, starts fresh
+    else:
+        cmd.extend(["--resume", SESSION_MODE])
     if config.get("system_prompt"): cmd.extend(["--system-prompt", config["system_prompt"]])
     if config.get("claude_model"): cmd.extend(["--model", config["claude_model"]])
     if config.get("allowed_tools"): cmd.extend(["--allowedTools", config["allowed_tools"]])
@@ -427,27 +462,13 @@ async def call_claude_cli(message, session_mode=None):
     except FileNotFoundError: return "❌ Claude CLI not found. Check claude_cli_path in config.", 0
     except Exception as e: return f"❌ {e}", int((time.monotonic()-start)*1000)
 
-async def list_claude_sessions():
-    """List existing Claude CLI sessions."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            config["claude_cli_path"], "sessions", "list",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        output = stdout.decode().strip()
-        if not output: return "No sessions found."
-        return output
-    except Exception as e:
-        return f"❌ Error listing sessions: {e}"
-
 def get_or_create_session(chat_id):
     db = get_db()
     row = db.execute("SELECT * FROM sessions WHERE telegram_chat_id=? AND is_active=1 ORDER BY last_active DESC LIMIT 1",(chat_id,)).fetchone()
     if row: db.close(); return dict(row)
     sid = str(uuid.uuid4())[:8]
-    mode = chat_session_mode.get(chat_id)
-    label = "continue (latest)" if mode is None else f"connected: {mode}" if mode != "new" else "new"
-    db.execute("INSERT INTO sessions (id,telegram_chat_id,claude_session_id,name) VALUES (?,?,?,?)",(sid,chat_id,mode or "continue",f"Chat ({label})"))
+    label = f"connected: {SESSION_MODE}" if SESSION_MODE != "continue" else "continue (latest)"
+    db.execute("INSERT INTO sessions (id,telegram_chat_id,claude_session_id,name) VALUES (?,?,?,?)",(sid,chat_id,SESSION_MODE,f"Chat ({label})"))
     db.commit(); r = dict(db.execute("SELECT * FROM sessions WHERE id=?",(sid,)).fetchone()); db.close(); return r
 
 def save_message(sid, role, content, ms=0):
@@ -466,66 +487,27 @@ def check_auth(update):
 async def cmd_start(update, context):
     if not check_auth(update):
         return await update.message.reply_text(f"🚫 Unauthorized. Your ID: {update.effective_user.id}")
-    mode = chat_session_mode.get(update.effective_chat.id)
-    if mode is None: mode_str = "continuing latest CLI session"
-    elif mode == "new": mode_str = "starting fresh sessions"
-    else: mode_str = f"connected to `{mode}`"
+    mode_str = f"connected to `{SESSION_MODE}`" if SESSION_MODE != "continue" else "continuing latest CLI session"
     await update.message.reply_text(
         f"👋 *Claude CLI Bridge*\n\n"
         f"Mode: {mode_str}\n\n"
-        f"*Commands:*\n"
-        f"/sessions — List your Claude CLI sessions\n"
-        f"/connect `<id>` — Connect to an existing session\n"
-        f"/continue — Continue most recent session (default)\n"
-        f"/new — Start a fresh session\n"
+        f"Send any message to chat with Claude.\n\n"
+        f"/new — Reset session\n"
         f"/status — Connection info\n"
         f"/id — Your Telegram user ID",
         parse_mode="Markdown")
-
-async def cmd_sessions(update, context):
-    if not check_auth(update): return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    output = await list_claude_sessions()
-    # Truncate if too long for Telegram
-    if len(output) > 4000: output = output[:4000] + "\n..."
-    await update.message.reply_text(f"📋 *Claude CLI Sessions:*\n\n```\n{output}\n```", parse_mode="Markdown")
-
-async def cmd_connect(update, context):
-    if not check_auth(update): return
-    if not context.args:
-        return await update.message.reply_text("Usage: `/connect <session-id>`\n\nRun /sessions to see available IDs.", parse_mode="Markdown")
-    session_id = context.args[0].strip()
-    chat_id = update.effective_chat.id
-    # Deactivate old bridge session
-    db = get_db(); db.execute("UPDATE sessions SET is_active=0 WHERE telegram_chat_id=?",(chat_id,)); db.commit(); db.close()
-    chat_session_mode[chat_id] = session_id
-    get_or_create_session(chat_id)
-    await update.message.reply_text(f"🔗 Connected to session `{session_id}`\n\nSend a message to continue that conversation.", parse_mode="Markdown")
-
-async def cmd_continue(update, context):
-    if not check_auth(update): return
-    chat_id = update.effective_chat.id
-    db = get_db(); db.execute("UPDATE sessions SET is_active=0 WHERE telegram_chat_id=?",(chat_id,)); db.commit(); db.close()
-    chat_session_mode[chat_id] = None
-    get_or_create_session(chat_id)
-    await update.message.reply_text("🔄 Continuing most recent Claude CLI session.\n\nEvery message will pick up your latest conversation.", parse_mode="Markdown")
 
 async def cmd_new(update, context):
     if not check_auth(update): return
     chat_id = update.effective_chat.id
     db = get_db(); db.execute("UPDATE sessions SET is_active=0 WHERE telegram_chat_id=?",(chat_id,)); db.commit(); db.close()
-    chat_session_mode[chat_id] = "new"
-    s = get_or_create_session(chat_id)
-    await update.message.reply_text(f"🆕 Fresh session mode. Next message starts a new conversation.", parse_mode="Markdown")
+    get_or_create_session(chat_id)
+    await update.message.reply_text("🆕 Session reset.", parse_mode="Markdown")
 
 async def cmd_status(update, context):
     if not check_auth(update): return
-    chat_id = update.effective_chat.id
-    s = get_or_create_session(chat_id)
-    mode = chat_session_mode.get(chat_id)
-    if mode is None: mode_str = "🔄 Continuing latest CLI session"
-    elif mode == "new": mode_str = "🆕 Fresh session mode"
-    else: mode_str = f"🔗 Connected to `{mode}`"
+    s = get_or_create_session(update.effective_chat.id)
+    mode_str = f"🔗 Connected to `{SESSION_MODE}`" if SESSION_MODE != "continue" else "🔄 Continuing latest CLI session"
     await update.message.reply_text(f"✅ *Bridge Active*\n{mode_str}\nMessages: {s['message_count']}", parse_mode="Markdown")
 
 async def cmd_id(update, context):
@@ -541,8 +523,7 @@ async def handle_message(update, context):
     s = get_or_create_session(chat_id)
     save_message(s["id"], "user", msg)
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    mode = chat_session_mode.get(chat_id)
-    resp, ms = await call_claude_cli(msg, mode)
+    resp, ms = await call_claude_cli(msg)
     save_message(s["id"], "assistant", resp, ms)
     update_session(s["id"])
     for i in range(0, len(resp), 4096):
@@ -556,9 +537,6 @@ async def lifespan(app):
     if config.get("telegram_token"):
         telegram_app = Application.builder().token(config["telegram_token"]).build()
         telegram_app.add_handler(CommandHandler("start", cmd_start))
-        telegram_app.add_handler(CommandHandler("sessions", cmd_sessions))
-        telegram_app.add_handler(CommandHandler("connect", cmd_connect))
-        telegram_app.add_handler(CommandHandler("continue", cmd_continue))
         telegram_app.add_handler(CommandHandler("new", cmd_new))
         telegram_app.add_handler(CommandHandler("status", cmd_status))
         telegram_app.add_handler(CommandHandler("id", cmd_id))
@@ -636,7 +614,8 @@ async def test(request:Request):
 
 if __name__=="__main__":
     init_db(); port=config.get("web_port",7860)
-    print(f"\n🌉 Claude ↔ Telegram Bridge\n   Dashboard: http://localhost:{port}\n   Ctrl+C to stop\n")
+    mode_label = f"session {SESSION_MODE}" if SESSION_MODE != "continue" else "latest session (--continue)"
+    print(f"\n🌉 Claude ↔ Telegram Bridge\n   Mode: {mode_label}\n   Dashboard: http://localhost:{port}\n   Ctrl+C to stop\n")
     uvicorn.run(app,host="0.0.0.0",port=port,log_level="info")
 SERVEREOF
 }
@@ -767,15 +746,17 @@ show_done() {
   echo ""
   echo -e "  ${GREEN}${BOLD}Installation complete!${RESET}"
   echo ""
-  echo -e "  ${BOLD}Commands:${RESET}"
-  echo -e "    ${CYAN}claude-telegram start${RESET}         Start (foreground)"
-  echo -e "    ${CYAN}claude-telegram bg${RESET}            Start in background"
-  echo -e "    ${CYAN}claude-telegram status${RESET}        Check status"
-  echo -e "    ${CYAN}claude-telegram stop${RESET}          Stop"
-  echo -e "    ${CYAN}claude-telegram autostart${RESET}     Auto-start on login (macOS)"
-  echo -e "    ${CYAN}claude-telegram config${RESET}        Edit config"
-  echo -e "    ${CYAN}claude-telegram logs${RESET}          View logs"
-  echo -e "    ${CYAN}claude-telegram uninstall${RESET}     Remove everything"
+  echo -e "  ${BOLD}Quick start:${RESET}"
+  echo -e "    ${CYAN}claude-telegram list${RESET}              List your Claude CLI sessions"
+  echo -e "    ${CYAN}claude-telegram start${RESET}             Start (continues latest session)"
+  echo -e "    ${CYAN}claude-telegram start <session>${RESET}   Start connected to specific session"
+  echo ""
+  echo -e "  ${BOLD}Other commands:${RESET}"
+  echo -e "    ${CYAN}claude-telegram stop${RESET}              Stop"
+  echo -e "    ${CYAN}claude-telegram bg [session]${RESET}      Run in background"
+  echo -e "    ${CYAN}claude-telegram status${RESET}            Check status"
+  echo -e "    ${CYAN}claude-telegram config${RESET}            Edit config"
+  echo -e "    ${CYAN}claude-telegram uninstall${RESET}         Remove everything"
   echo ""
   echo -e "  ${BOLD}Dashboard:${RESET} ${CYAN}http://localhost:7860${RESET}"
   echo ""

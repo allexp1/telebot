@@ -24,16 +24,17 @@ That's it. The interactive installer will:
 ## Usage
 
 ```bash
-claude-telegram start       # Start (foreground)
-claude-telegram bg          # Start in background
-claude-telegram stop        # Stop
-claude-telegram restart     # Restart
-claude-telegram status      # Check if running
-claude-telegram autostart   # Auto-start on macOS login
-claude-telegram no-autostart
-claude-telegram config      # Edit config file
-claude-telegram logs        # Tail log file
-claude-telegram uninstall   # Remove everything
+claude-telegram list              # List your Claude CLI sessions
+claude-telegram start             # Start bridge (continues latest session)
+claude-telegram start <session>   # Start bridge connected to a specific session
+claude-telegram stop              # Stop
+claude-telegram restart           # Restart
+claude-telegram bg [session]      # Start in background
+claude-telegram status            # Check if running
+claude-telegram autostart         # Auto-start on macOS login
+claude-telegram config            # Edit config file
+claude-telegram logs              # Tail log file
+claude-telegram uninstall         # Remove everything
 ```
 
 ## How It Works
@@ -62,17 +63,14 @@ Open **http://localhost:7860** after starting to get:
 
 ## Telegram Commands
 
-| Command              | Description                                  |
-|----------------------|----------------------------------------------|
-| `/start`             | Welcome message and help                     |
-| `/sessions`          | List your existing Claude CLI sessions       |
-| `/connect <id>`      | Connect to an existing CLI session           |
-| `/continue`          | Continue your most recent CLI session (default) |
-| `/new`               | Start a fresh session (no history)           |
-| `/status`            | Check connection and session info            |
-| `/id`                | Show your Telegram user ID                   |
+| Command    | Description                          |
+|------------|--------------------------------------|
+| `/start`   | Welcome message and session info     |
+| `/new`     | Reset the bridge session tracker     |
+| `/status`  | Check connection and session info    |
+| `/id`      | Show your Telegram user ID           |
 
-**Default behavior:** Messages are sent with `--continue`, so the bot automatically continues your most recent Claude CLI conversation. Use `/connect <id>` to attach to a specific session instead.
+The session is chosen when you start the bridge from your terminal — not from Telegram. Use `claude-telegram list` to see sessions, then `claude-telegram start <id>` to connect.
 
 ## MCP Tools
 
