@@ -397,7 +397,7 @@ def get_db():
 
 async def call_claude_cli(message, session_id=None):
     cmd = [config["claude_cli_path"], "-p", message]
-    if session_id: cmd.extend(["--session-id", session_id])
+    if session_id: cmd.extend(["--resume", session_id])
     if config.get("system_prompt"): cmd.extend(["--system-prompt", config["system_prompt"]])
     if config.get("claude_model"): cmd.extend(["--model", config["claude_model"]])
     if config.get("allowed_tools"): cmd.extend(["--allowedTools", config["allowed_tools"]])
