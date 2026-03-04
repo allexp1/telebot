@@ -62,14 +62,17 @@ Open **http://localhost:7860** after starting to get:
 
 ## Telegram Commands
 
-| Command    | Description                          |
-|------------|--------------------------------------|
-| `/start`   | Welcome message and help             |
-| `/new`     | Start a fresh conversation session   |
-| `/status`  | Check connection and session info    |
-| `/id`      | Show your Telegram user ID           |
+| Command              | Description                                  |
+|----------------------|----------------------------------------------|
+| `/start`             | Welcome message and help                     |
+| `/sessions`          | List your existing Claude CLI sessions       |
+| `/connect <id>`      | Connect to an existing CLI session           |
+| `/continue`          | Continue your most recent CLI session (default) |
+| `/new`               | Start a fresh session (no history)           |
+| `/status`            | Check connection and session info            |
+| `/id`                | Show your Telegram user ID                   |
 
-Any regular text message is forwarded to Claude CLI.
+**Default behavior:** Messages are sent with `--continue`, so the bot automatically continues your most recent Claude CLI conversation. Use `/connect <id>` to attach to a specific session instead.
 
 ## MCP Tools
 

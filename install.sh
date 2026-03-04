@@ -367,7 +367,7 @@ DASH_PATH = Path(__file__).parent / "dashboard.html"
 
 DEFAULT_CONFIG = {
     "telegram_token": "", "allowed_user_ids": [],
-    "system_prompt": "You are a helpful assistant communicating via Telegram. Keep responses concise and well-formatted for mobile reading.",
+    "system_prompt": "",
     "claude_cli_path": "claude", "max_response_length": 4096,
     "session_timeout_hours": 24, "web_port": 7860,
     "claude_model": "", "allowed_tools": "", "mcp_config": "",
@@ -383,6 +383,10 @@ def save_config(cfg):
 
 config = load_config()
 
+# Per-chat session mode: stores which Claude CLI session each chat is connected to
+# None = use --continue (most recent), "new" = no session flag, "<id>" = --resume <id>
+chat_session_mode = {}
+
 def init_db():
     conn = sqlite3.connect(str(DB_PATH)); conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
@@ -395,9 +399,16 @@ def init_db():
 def get_db():
     conn = sqlite3.connect(str(DB_PATH)); conn.row_factory = sqlite3.Row; return conn
 
-async def call_claude_cli(message, session_id=None):
+async def call_claude_cli(message, session_mode=None):
+    """Call Claude CLI.
+    session_mode: None = --continue (most recent), "new" = fresh, "<id>" = --resume <id>
+    """
     cmd = [config["claude_cli_path"], "-p", message]
-    if session_id: cmd.extend(["--resume", session_id])
+    if session_mode is None:
+        cmd.append("--continue")
+    elif session_mode != "new":
+        cmd.extend(["--resume", session_mode])
+    # "new" = no session flag, starts fresh
     if config.get("system_prompt"): cmd.extend(["--system-prompt", config["system_prompt"]])
     if config.get("claude_model"): cmd.extend(["--model", config["claude_model"]])
     if config.get("allowed_tools"): cmd.extend(["--allowedTools", config["allowed_tools"]])
@@ -416,12 +427,27 @@ async def call_claude_cli(message, session_id=None):
     except FileNotFoundError: return "❌ Claude CLI not found. Check claude_cli_path in config.", 0
     except Exception as e: return f"❌ {e}", int((time.monotonic()-start)*1000)
 
+async def list_claude_sessions():
+    """List existing Claude CLI sessions."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            config["claude_cli_path"], "sessions", "list",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        output = stdout.decode().strip()
+        if not output: return "No sessions found."
+        return output
+    except Exception as e:
+        return f"❌ Error listing sessions: {e}"
+
 def get_or_create_session(chat_id):
     db = get_db()
     row = db.execute("SELECT * FROM sessions WHERE telegram_chat_id=? AND is_active=1 ORDER BY last_active DESC LIMIT 1",(chat_id,)).fetchone()
     if row: db.close(); return dict(row)
-    sid, csid = str(uuid.uuid4())[:8], str(uuid.uuid4())
-    db.execute("INSERT INTO sessions (id,telegram_chat_id,claude_session_id,name) VALUES (?,?,?,?)",(sid,chat_id,csid,f"Chat {sid}"))
+    sid = str(uuid.uuid4())[:8]
+    mode = chat_session_mode.get(chat_id)
+    label = "continue (latest)" if mode is None else f"connected: {mode}" if mode != "new" else "new"
+    db.execute("INSERT INTO sessions (id,telegram_chat_id,claude_session_id,name) VALUES (?,?,?,?)",(sid,chat_id,mode or "continue",f"Chat ({label})"))
     db.commit(); r = dict(db.execute("SELECT * FROM sessions WHERE id=?",(sid,)).fetchone()); db.close(); return r
 
 def save_message(sid, role, content, ms=0):
@@ -432,35 +458,91 @@ def update_session(sid):
 
 telegram_app = None
 
-async def cmd_start(update, context):
+def check_auth(update):
     if config["allowed_user_ids"] and update.effective_user.id not in config["allowed_user_ids"]:
+        return False
+    return True
+
+async def cmd_start(update, context):
+    if not check_auth(update):
         return await update.message.reply_text(f"🚫 Unauthorized. Your ID: {update.effective_user.id}")
-    await update.message.reply_text("👋 *Claude CLI Bridge*\n\nSend any message to chat with Claude.\n\n/new — New session\n/status — Connection info\n/id — Your user ID", parse_mode="Markdown")
+    mode = chat_session_mode.get(update.effective_chat.id)
+    if mode is None: mode_str = "continuing latest CLI session"
+    elif mode == "new": mode_str = "starting fresh sessions"
+    else: mode_str = f"connected to `{mode}`"
+    await update.message.reply_text(
+        f"👋 *Claude CLI Bridge*\n\n"
+        f"Mode: {mode_str}\n\n"
+        f"*Commands:*\n"
+        f"/sessions — List your Claude CLI sessions\n"
+        f"/connect `<id>` — Connect to an existing session\n"
+        f"/continue — Continue most recent session (default)\n"
+        f"/new — Start a fresh session\n"
+        f"/status — Connection info\n"
+        f"/id — Your Telegram user ID",
+        parse_mode="Markdown")
+
+async def cmd_sessions(update, context):
+    if not check_auth(update): return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    output = await list_claude_sessions()
+    # Truncate if too long for Telegram
+    if len(output) > 4000: output = output[:4000] + "\n..."
+    await update.message.reply_text(f"📋 *Claude CLI Sessions:*\n\n```\n{output}\n```", parse_mode="Markdown")
+
+async def cmd_connect(update, context):
+    if not check_auth(update): return
+    if not context.args:
+        return await update.message.reply_text("Usage: `/connect <session-id>`\n\nRun /sessions to see available IDs.", parse_mode="Markdown")
+    session_id = context.args[0].strip()
+    chat_id = update.effective_chat.id
+    # Deactivate old bridge session
+    db = get_db(); db.execute("UPDATE sessions SET is_active=0 WHERE telegram_chat_id=?",(chat_id,)); db.commit(); db.close()
+    chat_session_mode[chat_id] = session_id
+    get_or_create_session(chat_id)
+    await update.message.reply_text(f"🔗 Connected to session `{session_id}`\n\nSend a message to continue that conversation.", parse_mode="Markdown")
+
+async def cmd_continue(update, context):
+    if not check_auth(update): return
+    chat_id = update.effective_chat.id
+    db = get_db(); db.execute("UPDATE sessions SET is_active=0 WHERE telegram_chat_id=?",(chat_id,)); db.commit(); db.close()
+    chat_session_mode[chat_id] = None
+    get_or_create_session(chat_id)
+    await update.message.reply_text("🔄 Continuing most recent Claude CLI session.\n\nEvery message will pick up your latest conversation.", parse_mode="Markdown")
 
 async def cmd_new(update, context):
-    if config["allowed_user_ids"] and update.effective_user.id not in config["allowed_user_ids"]: return
-    db = get_db(); db.execute("UPDATE sessions SET is_active=0 WHERE telegram_chat_id=?",(update.effective_chat.id,)); db.commit(); db.close()
-    s = get_or_create_session(update.effective_chat.id)
-    await update.message.reply_text(f"🆕 New session: `{s['id']}`", parse_mode="Markdown")
+    if not check_auth(update): return
+    chat_id = update.effective_chat.id
+    db = get_db(); db.execute("UPDATE sessions SET is_active=0 WHERE telegram_chat_id=?",(chat_id,)); db.commit(); db.close()
+    chat_session_mode[chat_id] = "new"
+    s = get_or_create_session(chat_id)
+    await update.message.reply_text(f"🆕 Fresh session mode. Next message starts a new conversation.", parse_mode="Markdown")
 
 async def cmd_status(update, context):
-    if config["allowed_user_ids"] and update.effective_user.id not in config["allowed_user_ids"]: return
-    s = get_or_create_session(update.effective_chat.id)
-    await update.message.reply_text(f"✅ *Bridge Active*\nSession: `{s['id']}`\nMessages: {s['message_count']}", parse_mode="Markdown")
+    if not check_auth(update): return
+    chat_id = update.effective_chat.id
+    s = get_or_create_session(chat_id)
+    mode = chat_session_mode.get(chat_id)
+    if mode is None: mode_str = "🔄 Continuing latest CLI session"
+    elif mode == "new": mode_str = "🆕 Fresh session mode"
+    else: mode_str = f"🔗 Connected to `{mode}`"
+    await update.message.reply_text(f"✅ *Bridge Active*\n{mode_str}\nMessages: {s['message_count']}", parse_mode="Markdown")
 
 async def cmd_id(update, context):
     await update.message.reply_text(f"Your Telegram user ID: `{update.effective_user.id}`", parse_mode="Markdown")
 
 async def handle_message(update, context):
     uid = update.effective_user.id
-    if config["allowed_user_ids"] and uid not in config["allowed_user_ids"]:
+    if not check_auth(update):
         return await update.message.reply_text(f"🚫 Unauthorized. Your ID: {uid}")
     msg = update.message.text
     if not msg: return
-    s = get_or_create_session(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    s = get_or_create_session(chat_id)
     save_message(s["id"], "user", msg)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    resp, ms = await call_claude_cli(msg, s["claude_session_id"])
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    mode = chat_session_mode.get(chat_id)
+    resp, ms = await call_claude_cli(msg, mode)
     save_message(s["id"], "assistant", resp, ms)
     update_session(s["id"])
     for i in range(0, len(resp), 4096):
@@ -474,6 +556,9 @@ async def lifespan(app):
     if config.get("telegram_token"):
         telegram_app = Application.builder().token(config["telegram_token"]).build()
         telegram_app.add_handler(CommandHandler("start", cmd_start))
+        telegram_app.add_handler(CommandHandler("sessions", cmd_sessions))
+        telegram_app.add_handler(CommandHandler("connect", cmd_connect))
+        telegram_app.add_handler(CommandHandler("continue", cmd_continue))
         telegram_app.add_handler(CommandHandler("new", cmd_new))
         telegram_app.add_handler(CommandHandler("status", cmd_status))
         telegram_app.add_handler(CommandHandler("id", cmd_id))
