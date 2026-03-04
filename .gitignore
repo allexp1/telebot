@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+config.json
+bridge.log
+bridge.err
+.DS_Store
