@@ -111,7 +111,7 @@ CFGEOF
 write_mirror() {
 cat > "$INSTALL_DIR/mirror.py" << 'PYEOF'
 """
-Claude CLI <-> Telegram Mirror
+Claude CLI <-> Telegram Mirror v2
 Spawns Claude CLI in a PTY. Streams all output to Telegram.
 Accepts input from Telegram. Shows Yes/No buttons for permission prompts.
 """
@@ -121,6 +121,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -146,41 +147,58 @@ output_buffer = ""
 buffer_lock = asyncio.Lock()
 telegram_chat_id: Optional[int] = None
 bot_app: Optional[Application] = None
-flush_task: Optional[asyncio.Task] = None
 SESSION_MODE = os.environ.get("CLAUDE_SESSION_MODE", "continue")
 
-# ── ANSI / terminal cleanup ──
-ANSI_RE = re.compile(
-    r'\x1b(?:\[[\d;?]*[A-Za-z]|\(B|\][\d;]*.*?(?:\x07|\x1b\\)|[>=<78HMND])'
-    r'|[\x00-\x08\x0b\x0c\x0e-\x1f]',
-    re.DOTALL
-)
-SPINNER_RE = re.compile(r'^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◓◑◒●○◉◎⬤|/\-\\]+\s*', re.UNICODE)
-
+# ── Terminal output cleanup ──
 def clean(text: str) -> str:
-    text = ANSI_RE.sub('', text)
-    # Catch orphaned sequences where ESC was already stripped
-    text = re.sub(r'\[\?[\d;]*[A-Za-z]', '', text)
-    # Catch other common leaked sequences
-    text = re.sub(r'\[[\d;]*[mGKHJP]', '', text)
+    """Aggressively strip ALL terminal escape sequences and control chars."""
+    # Strip ESC + anything that follows common patterns
+    # CSI sequences: ESC [ ... (any params including ? < > =) ... letter
+    text = re.sub(r'\x1b\[[\x20-\x3f]*[\x40-\x7e]', '', text)
+    # OSC sequences: ESC ] ... ST
+    text = re.sub(r'\x1b\].*?(?:\x07|\x1b\\)', '', text, flags=re.DOTALL)
+    # Other ESC sequences (2-char)
+    text = re.sub(r'\x1b[^[\]].?', '', text)
+    # Bare ESC at end
+    text = re.sub(r'\x1b$', '', text)
+
+    # Orphaned bracket sequences (ESC was already eaten but [...] remains)
+    # Matches: [?2026l  [>0q  [<U  [1m  [0;32m  [?25h  [2K  etc.
+    text = re.sub(r'\[[\?<>=]?[\d;]*[A-Za-z]', '', text)
+    # Catch remaining [> or [< followed by digits and letter
+    text = re.sub(r'\[[<>=\?]\d*[a-zA-Z]?', '', text)
+
+    # Control characters (keep \n \r \t)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+    # Spinner / progress characters
+    text = re.sub(r'[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◓◑◒●○◉◎⬤]+\s*', '', text)
+
+    # Process lines
     lines = []
     for line in text.split('\n'):
+        # Carriage return: keep only last segment
         if '\r' in line:
             line = line.split('\r')[-1]
-        line = SPINNER_RE.sub('', line.strip())
-        if line:
+        line = line.strip()
+        # Skip empty lines and lines that are just brackets/punctuation
+        if line and not re.match(r'^[\[\]<>(){}\s]*$', line):
             lines.append(line)
+
     result = '\n'.join(lines)
-    return re.sub(r'\n{3,}', '\n\n', result).strip()
+    # Collapse multiple blank lines
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
+
 
 def is_permission_prompt(text: str) -> bool:
     patterns = [
         r'(?:Allow|Approve|Grant|Permit)\s+.*\?',
-        r'Do you want to (?:allow|proceed|continue|run|execute)',
+        r'Do you want to',
         r'\(y(?:es)?/n(?:o)?\)',
         r'\[Y/n\]', r'\[y/N\]',
         r'Do you trust',
-        r'(?:Yes|No)\s*/\s*(?:Yes|No)',
+        r'Allow .*tool',
     ]
     return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
@@ -209,19 +227,21 @@ async def tg_send(text: str, buttons: bool = False):
                 InlineKeyboardButton("❌ No", callback_data="perm_n"),
             ]])
         try:
+            # Try as preformatted text first
             try:
                 await bot.send_message(telegram_chat_id, f"```\n{chunk}\n```",
                                        parse_mode="Markdown", reply_markup=markup)
             except Exception:
+                # Fallback to plain text
                 await bot.send_message(telegram_chat_id, chunk, reply_markup=markup)
         except Exception as e:
             print(f"[tg] send err: {e}")
 
-# ── Buffer flusher — collects output then sends ──
+# ── Buffer flusher ──
 async def flush_loop():
     global output_buffer
     while True:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1.5)  # Wait 1.5s to collect a full response chunk
         async with buffer_lock:
             if output_buffer:
                 raw = output_buffer
@@ -230,33 +250,69 @@ async def flush_loop():
                 continue
         text = clean(raw)
         if text:
+            print(f"[tg] sending {len(text)} chars")
             await tg_send(text, buttons=is_permission_prompt(text))
 
-# ── Read CLI stdout continuously ──
+# ── Read CLI output ──
 async def read_loop():
     global output_buffer, cli_process
-    if not cli_process: return
-    loop = asyncio.get_event_loop()
-    while cli_process and cli_process.isalive():
-        try:
-            data = await loop.run_in_executor(
-                None, lambda: cli_process.read_nonblocking(4096, timeout=0.3)
-            )
-            if data:
-                async with buffer_lock:
-                    output_buffer += data
-        except pexpect.TIMEOUT:
-            continue
-        except pexpect.EOF:
+    if not cli_process:
+        print("[read] no cli_process!")
+        return
+
+    print("[read] starting read loop")
+
+    while True:
+        if not cli_process or not cli_process.isalive():
+            print("[read] CLI process dead, exiting loop")
+            # Flush remaining buffer
             async with buffer_lock:
                 if output_buffer:
-                    text = clean(output_buffer); output_buffer = ""
-                    if text: await tg_send(text)
+                    text = clean(output_buffer)
+                    output_buffer = ""
+                    if text:
+                        await tg_send(text)
             await tg_send("⏹️ CLI session ended.")
             break
+
+        try:
+            # Use expect with timeout - more reliable than read_nonblocking
+            index = cli_process.expect([pexpect.TIMEOUT, pexpect.EOF], timeout=0.5)
+
+            # Always grab whatever is in before buffer
+            if cli_process.before:
+                data = cli_process.before
+                if data:
+                    async with buffer_lock:
+                        output_buffer += data
+                    print(f"[read] got {len(data)} chars")
+
+            if index == 1:  # EOF
+                print("[read] EOF")
+                async with buffer_lock:
+                    if output_buffer:
+                        text = clean(output_buffer)
+                        output_buffer = ""
+                        if text:
+                            await tg_send(text)
+                await tg_send("⏹️ CLI session ended.")
+                break
+
+        except pexpect.TIMEOUT:
+            # Check if there's data in before buffer even on timeout
+            if cli_process.before:
+                data = cli_process.before
+                if data:
+                    async with buffer_lock:
+                        output_buffer += data
+            continue
+        except pexpect.EOF:
+            print("[read] EOF exception")
+            break
         except Exception as e:
-            print(f"[read] err: {e}")
-            await asyncio.sleep(0.5)
+            print(f"[read] error: {e}")
+            traceback.print_exc()
+            await asyncio.sleep(1)
 
 # ── Start CLI ──
 def spawn_cli(session_mode: str) -> pexpect.spawn:
@@ -268,15 +324,29 @@ def spawn_cli(session_mode: str) -> pexpect.spawn:
     elif session_mode and session_mode != "new":
         args.extend(["--resume", session_mode])
 
-    print(f"[cli] spawn: {path} {' '.join(args)}")
+    full_cmd = f"{path} {' '.join(args)}"
+    print(f"[cli] spawning: {full_cmd}")
+
+    env = os.environ.copy()
+    env["TERM"] = "dumb"
+    env["NO_COLOR"] = "1"
+    env["FORCE_COLOR"] = "0"
+    env["COLUMNS"] = "120"
+    env["LINES"] = "40"
+    # Disable any special terminal features
+    env["TERM_PROGRAM"] = ""
+    env["COLORTERM"] = ""
+
     cli_process = pexpect.spawn(
         path, args,
         encoding='utf-8', timeout=None,
-        env={**os.environ, "TERM": "dumb", "NO_COLOR": "1", "FORCE_COLOR": "0"},
+        env=env,
         dimensions=(40, 120),
     )
     cli_process.setecho(False)
     cli_process.delaybeforesend = 0.05
+
+    print(f"[cli] PID: {cli_process.pid}, alive: {cli_process.isalive()}")
     return cli_process
 
 # ── Telegram handlers ──
@@ -333,6 +403,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not cli_process or not cli_process.isalive():
         return await update.message.reply_text("⚠️ CLI not running. /restart")
     try:
+        print(f"[input] sending to CLI: {msg[:80]}")
         cli_process.sendline(msg)
     except Exception as e:
         await update.message.reply_text(f"❌ {e}")
@@ -360,13 +431,16 @@ async def post_init(app: Application):
     spawn_cli(SESSION_MODE)
     asyncio.create_task(read_loop())
     asyncio.create_task(flush_loop())
+    print("[boot] read_loop and flush_loop started")
 
 def main():
     token = config.get("telegram_token", "")
     if not token:
         print("❌ No telegram_token in config.json"); sys.exit(1)
     mode = f"session {SESSION_MODE}" if SESSION_MODE != "continue" else "latest (--continue)"
-    print(f"\n🪞 Claude CLI ↔ Telegram Mirror\n   Session: {mode}\n   Ctrl+C to stop\n")
+    print(f"\n🪞 Claude CLI ↔ Telegram Mirror")
+    print(f"   Session: {mode}")
+    print(f"   Ctrl+C to stop\n")
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("restart", cmd_restart))
