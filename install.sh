@@ -151,7 +151,7 @@ SESSION_MODE = os.environ.get("CLAUDE_SESSION_MODE", "continue")
 
 # ── ANSI / terminal cleanup ──
 ANSI_RE = re.compile(
-    r'\x1b(?:\[[\d;]*[A-Za-z]|\(B|\][\d;]*.*?(?:\x07|\x1b\\)|[>=<78HMND])'
+    r'\x1b(?:\[[\d;?]*[A-Za-z]|\(B|\][\d;]*.*?(?:\x07|\x1b\\)|[>=<78HMND])'
     r'|[\x00-\x08\x0b\x0c\x0e-\x1f]',
     re.DOTALL
 )
@@ -159,6 +159,10 @@ SPINNER_RE = re.compile(r'^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯�
 
 def clean(text: str) -> str:
     text = ANSI_RE.sub('', text)
+    # Catch orphaned sequences where ESC was already stripped
+    text = re.sub(r'\[\?[\d;]*[A-Za-z]', '', text)
+    # Catch other common leaked sequences
+    text = re.sub(r'\[[\d;]*[mGKHJP]', '', text)
     lines = []
     for line in text.split('\n'):
         if '\r' in line:
